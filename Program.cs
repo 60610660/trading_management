@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Configuration;
+﻿​using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using NetMQ;
 using NetMQ.Sockets;
 using Newtonsoft.Json; // 我們將使用 Newtonsoft.Json 來處理 JSON
+using TradingManagementServices; // 引入 SystemStatusService
 
 namespace TradingManagement
 {
@@ -86,91 +87,197 @@ namespace TradingManagement
         private readonly ZeroMqSettings _settings;
         private readonly IStrategyManager _strategyManager;
         private readonly IPerformanceManager _performanceManager;
+        private readonly ISystemStatusService _statusService;
         private NetMQPoller? _poller;
         private SubscriberSocket? _marketDataSubscriber;
         private RequestSocket? _commandRequester;
         private PullSocket? _statusReportReceiver;
 
         public TradingWorker(ILogger<TradingWorker> logger,
-                             IConfiguration configuration,
+                             ZeroMqSettings settings,
                              IStrategyManager strategyManager,
-                             IPerformanceManager performanceManager)
+                             IPerformanceManager performanceManager,
+                             ISystemStatusService statusService)
         {
             _logger = logger;
-            _settings = configuration.GetSection("ZeroMqSettings").Get<ZeroMqSettings>()!;
+            _settings = settings ?? throw new ArgumentNullException(nameof(settings), "ZeroMqSettings cannot be null.");
+            
+            _logger.LogInformation("ZeroMqSettings received via DI: MarketDataAddress={MarketDataAddress}, CommandAddress={CommandAddress}, StatusReportAddress={StatusReportAddress}", 
+                                 _settings.MarketDataAddress, _settings.CommandAddress, _settings.StatusReportAddress);
+            
+            if (string.IsNullOrEmpty(_settings.MarketDataAddress) || 
+                string.IsNullOrEmpty(_settings.CommandAddress) || 
+                string.IsNullOrEmpty(_settings.StatusReportAddress))
+            {
+                _logger.LogError("One or more ZeroMQ addresses are missing in ZeroMqSettings.");
+                throw new InvalidOperationException("One or more ZeroMQ addresses are missing in ZeroMqSettings. Please check appsettings.json.");
+            }
+
             _strategyManager = strategyManager;
             _performanceManager = performanceManager;
+            _statusService = statusService;
         }
 
         private void InitializeSockets()
         {
-            _marketDataSubscriber = new SubscriberSocket();
-            _commandRequester = new RequestSocket();
-            _statusReportReceiver = new PullSocket();
+            _logger.LogInformation("Initializing Sockets...");
+            try
+            {
+                _marketDataSubscriber = new SubscriberSocket();
+                _logger.LogInformation("_marketDataSubscriber created.");
+                _commandRequester = new RequestSocket();
+                _logger.LogInformation("_commandRequester created.");
+                _statusReportReceiver = new PullSocket();
+                _logger.LogInformation("_statusReportReceiver created.");
 
-            _poller = new NetMQPoller { _marketDataSubscriber, _statusReportReceiver };
+                // 在將 Sockets 添加到 Poller 之前，確保它們不是 null
+                if (_marketDataSubscriber == null || _commandRequester == null || _statusReportReceiver == null)
+                {
+                    _logger.LogError("One or more sockets failed to initialize before adding to poller.");
+                    // 這種情況下 _poller 可能會保持為 null，並在後續檢查中被捕獲
+                    return; 
+                }
 
-            _marketDataSubscriber.ReceiveReady += HandleMarketData;
-            _statusReportReceiver.ReceiveReady += HandleStatusReport;
+                _poller = new NetMQPoller { _marketDataSubscriber, _statusReportReceiver }; 
+                _logger.LogInformation("_poller created. Is _poller null? {IsPollerNull}", _poller == null);
+                
+                // 確保 Poller 成功建立
+                if (_poller == null)
+                {
+                    _logger.LogError("NetMQPoller failed to initialize.");
+                    return; // 避免後續對 null _poller 的操作
+                }
+
+                _marketDataSubscriber.ReceiveReady += HandleMarketData;
+                _statusReportReceiver.ReceiveReady += HandleStatusReport;
+                _logger.LogInformation("Socket ReceiveReady events subscribed.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Exception during InitializeSockets.");
+                // 確保在異常情況下，依賴於這些 sockets 的後續代碼不會執行
+                // 可以考慮重新拋出或設定一個標誌指示初始化失敗
+                _poller = null; // 確保 poller 為 null，以觸發後續的檢查
+                throw; // 重新拋出，讓 BackgroundService 知道啟動失敗
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("C# ZeroMQ Connector (Worker) 啟動中...");
-
-            InitializeSockets();
-
-            if (_marketDataSubscriber == null || _commandRequester == null || _statusReportReceiver == null || _poller == null)
-            {
-                _logger.LogError("Sockets 或 Poller 初始化失敗。Worker 停止。");
-                return;
-            }
+            _logger.LogInformation("C# ZeroMQ Connector (Worker) ExecuteAsync starting...");
+            _logger.LogInformation("Initial Poller state in ExecuteAsync: Is _poller null? {IsPollerNull}", _poller == null);
 
             try
             {
+                InitializeSockets();
+                _logger.LogInformation("InitializeSockets completed. Current Poller state: Is _poller null? {IsPollerNull}", _poller == null);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize sockets in ExecuteAsync. Worker cannot start.");
+                _statusService.ZeroMqMarketDataStatus = "Error: Init failed";
+                _statusService.ZeroMqCommandStatus = "Error: Init failed";
+                _statusService.ZeroMqStatusReportStatus = "Error: Init failed";
+                return; // 初始化失敗，直接返回
+            }
+
+
+            if (_marketDataSubscriber == null || _commandRequester == null || _statusReportReceiver == null || _poller == null)
+            {
+                _logger.LogError("Sockets or Poller is null after InitializeSockets. Worker stopping. MarketDataSub: {MDS}, CmdReq: {CR}, StatusRec: {SR}, Poller: {P}", 
+                                 _marketDataSubscriber == null, _commandRequester == null, _statusReportReceiver == null, _poller == null);
+                _statusService.ZeroMqMarketDataStatus = "Error: Sockets null";
+                _statusService.ZeroMqCommandStatus = "Error: Sockets null";
+                _statusService.ZeroMqStatusReportStatus = "Error: Sockets null";
+                return;
+            }
+
+            _logger.LogInformation("All sockets and poller seem initialized. Proceeding to connect.");
+
+            try
+            {
+                _logger.LogInformation("Connecting MarketDataSubscriber to {Address}", _settings.MarketDataAddress);
                 _marketDataSubscriber.Connect(_settings.MarketDataAddress);
                 _marketDataSubscriber.Subscribe("");
-                _logger.LogInformation("已連接到市場數據發布者: {Address}", _settings.MarketDataAddress);
+                _logger.LogInformation("MarketDataSubscriber connected and subscribed.");
+                _statusService.ZeroMqMarketDataStatus = $"Connected to {_settings.MarketDataAddress}";
 
+                _logger.LogInformation("Connecting CommandRequester to {Address}", _settings.CommandAddress);
                 _commandRequester.Connect(_settings.CommandAddress);
-                _logger.LogInformation("已連接到命令處理器: {Address}", _settings.CommandAddress);
+                _logger.LogInformation("CommandRequester connected.");
+                _statusService.ZeroMqCommandStatus = $"Connected to {_settings.CommandAddress}";
 
+                _logger.LogInformation("Connecting StatusReportReceiver to {Address}", _settings.StatusReportAddress);
                 _statusReportReceiver.Connect(_settings.StatusReportAddress);
-                _logger.LogInformation("已連接到狀態報告推送器: {Address}", _settings.StatusReportAddress);
+                _logger.LogInformation("StatusReportReceiver connected.");
+                _statusService.ZeroMqStatusReportStatus = $"Connected to {_settings.StatusReportAddress}";
 
                 _ = SendTestCommandAsync();
 
                 stoppingToken.Register(() =>
                 {
-                    _logger.LogInformation("停止信號已接收。停止 Poller...");
-                    _poller?.Stop();
+                    _logger.LogInformation("Stop signal received. Stopping Poller...");
+                    _poller?.Stop(); 
                 });
 
-                _logger.LogInformation("C# ZeroMQ Connector (Worker) 已啟動。開始輪詢訊息...");
+                _logger.LogInformation("Starting Poller.Run in Task.Run...");
+                await Task.Run(() => 
+                {
+                    try
+                    {
+                        _logger.LogInformation("Poller Task.Run: Entering _poller.Run()");
+                        _poller?.Run(); 
+                        _logger.LogInformation("Poller Task.Run: _poller.Run() exited.");
+                    }
+                    catch (System.Runtime.InteropServices.SEHException sehEx)
+                    {
+                        _logger.LogWarning(sehEx, "Poller Task.Run: SEHException during Poller.Run, possibly after Stop.");
+                    }
+                    catch (NetMQ.TerminatingException termEx)
+                    {
+                        _logger.LogInformation(termEx, "Poller Task.Run: Poller terminated as expected.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Poller Task.Run: Exception in Poller Task.Run");
+                    }
+                }, stoppingToken);
 
-                _poller.Run();
-
-                _logger.LogInformation("Poller 已停止。");
+                _logger.LogInformation("Poller Task.Run completed or cancelled.");
 
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
             {
-                _logger.LogError(ex, "Worker 執行期間發生未處理的例外狀況");
+                _logger.LogInformation("ExecuteAsync received OperationCanceledException. Worker stopping.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled exception in ExecuteAsync after socket initialization.");
+                _statusService.ZeroMqMarketDataStatus = "Error: Runtime";
+                _statusService.ZeroMqCommandStatus = "Error: Runtime";
+                _statusService.ZeroMqStatusReportStatus = "Error: Runtime";
             }
             finally
             {
-                _logger.LogInformation("Worker 正在清理資源...");
-                _poller?.Dispose();
+                _logger.LogInformation("ExecuteAsync finally block. Cleaning up resources...");
+                
                 _marketDataSubscriber?.Disconnect(_settings.MarketDataAddress);
                 _marketDataSubscriber?.Close();
                 _marketDataSubscriber?.Dispose();
+                _statusService.ZeroMqMarketDataStatus = "Disconnected";
+
                 _commandRequester?.Disconnect(_settings.CommandAddress);
                 _commandRequester?.Close();
                 _commandRequester?.Dispose();
+                _statusService.ZeroMqCommandStatus = "Disconnected";
+
                 _statusReportReceiver?.Disconnect(_settings.StatusReportAddress);
                 _statusReportReceiver?.Close();
                 _statusReportReceiver?.Dispose();
-                _logger.LogInformation("Worker 清理完成。");
+                _statusService.ZeroMqStatusReportStatus = "Disconnected";
+
+                 _poller?.Dispose(); 
+                _logger.LogInformation("Worker cleanup complete.");
             }
         }
 
@@ -188,6 +295,7 @@ namespace TradingManagement
                     _logger.LogInformation("市場數據: {Symbol} Bid: {Bid} Ask: {Ask} Time: {Timestamp}", data.Symbol ?? "N/A", data.Bid, data.Ask, data.Timestamp);
                     _strategyManager.ProcessMarketUpdate(data);
                     _performanceManager.UpdatePerformance(data);
+                    _statusService.UpdateLastMarketData(data);
                 }
                 else
                 {
@@ -197,13 +305,13 @@ namespace TradingManagement
             catch (NetMQException ex) when (ex.ErrorCode != ErrorCode.ContextTerminated)
             {
                 _logger.LogError(ex, "市場數據接收錯誤");
-                }
-                catch (JsonException jsonEx)
-                {
+            }
+            catch (JsonException jsonEx)
+            {
                 _logger.LogError(jsonEx, "市場數據JSON反序列化錯誤");
-                }
-                catch (Exception ex)
-                {
+            }
+            catch (Exception ex)
+            {
                 _logger.LogError(ex, "處理市場數據時發生未知錯誤");
             }
         }
@@ -221,6 +329,7 @@ namespace TradingManagement
                     _logger.LogInformation("狀態報告: Strategy: {StrategyId} Status: {Status} Msg: {Message} Time: {Timestamp}",
                         report.StrategyId ?? "N/A", report.Status ?? "N/A", report.Message ?? "N/A", report.Timestamp);
                     _strategyManager.UpdateStrategyStatus(report);
+                    _statusService.UpdateLastStatusReport(report);
                 }
                 else
                 {
@@ -230,13 +339,13 @@ namespace TradingManagement
             catch (NetMQException ex) when (ex.ErrorCode != ErrorCode.ContextTerminated)
             {
                 _logger.LogError(ex, "狀態報告接收錯誤");
-                }
-                catch (JsonException jsonEx)
-                {
+            }
+            catch (JsonException jsonEx)
+            {
                 _logger.LogError(jsonEx, "狀態報告JSON反序列化錯誤");
-                }
-                catch (Exception ex)
-                {
+            }
+            catch (Exception ex)
+            {
                 _logger.LogError(ex, "處理狀態報告時發生未知錯誤");
             }
         }
@@ -249,7 +358,7 @@ namespace TradingManagement
                 return;
             }
 
-            await Task.Delay(1000);
+            await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken.None); // 使用 CancellationToken.None 如果不希望此延遲被 worker 的 stoppingToken 取消
 
             var testCommand = new Command
             {
@@ -263,16 +372,24 @@ namespace TradingManagement
             bool received = false;
             try
             {
-                lock (_commandRequester)
+                // 檢查 _commandRequester 是否已被 dispose
+                if (_commandRequester.IsDisposed) 
                 {
-                    if (!_commandRequester.IsDisposed)
+                    _logger.LogWarning("Command Requester 已釋放，無法發送或接收命令。");
+                    return;
+                }
+
+                lock (_commandRequester) // 確保線程安全訪問
+                {
+                    if (!_commandRequester.IsDisposed) // 再次檢查，因為 lock 不是經時的
                     {
-                        _commandRequester.SendFrame(commandJson);
-                        received = _commandRequester.TryReceiveFrameString(TimeSpan.FromSeconds(5), out responseJson);
-            }
-            else
-            {
-                        _logger.LogWarning("Command Requester 已釋放，無法發送或接收命令。");
+                         _commandRequester.SendFrame(commandJson);
+                         received = _commandRequester.TryReceiveFrameString(TimeSpan.FromSeconds(5), out responseJson);
+                    } 
+                    else
+                    {
+                         _logger.LogWarning("Command Requester 在鎖定後發現已釋放。");
+                         return;
                     }
                 }
 
@@ -282,6 +399,7 @@ namespace TradingManagement
                 }
                 else
                 {
+                    // 再次檢查 IsDisposed，避免在已釋放的 socket上記錄超時
                     if (!_commandRequester.IsDisposed)
                     {
                         _logger.LogWarning("命令回應超時。");
@@ -292,6 +410,11 @@ namespace TradingManagement
             {
                 _logger.LogWarning("嘗試在已釋放的 Command Requester 上操作。");
             }
+            // 添加對 TerminatingException 的處理，以防 Socket 在等待回應時終止
+            catch (NetMQ.TerminatingException termEx)
+            {
+                _logger.LogWarning(termEx, "Command Requester 在嘗試發送/接收時終止。");
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "發送或接收命令時出錯");
@@ -299,41 +422,25 @@ namespace TradingManagement
         }
     }
 
-    // --- 程式進入點 ---
+    // --- 程式進入點 (現在由 App.xaml.cs 處理) ---
     public class Program
     {
-        public static async Task Main(string[] args)
+        // 將 Main 方法重新命名，以避免多個進入點的錯誤 CS0017
+        public static void OriginalProgramMain(string[] args) 
         {
-            await CreateHostBuilder(args).Build().RunAsync();
+            // WPF 應用程式的進入點現在是 App.xaml.cs
+            // TradingWorker 等服務由 App.xaml.cs 中的通用主機管理。
+            // 此方法不再是應用程式的直接進入點。
         }
 
+        // CreateHostBuilder 方法已不再需要，因為配置已移至 App.xaml.cs
+        /*
         public static IHostBuilder CreateHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
-                .ConfigureAppConfiguration((hostingContext, config) =>
-                {
-                    // 可在此處添加更多設定來源
-                })
-                .ConfigureLogging(logging =>
-                {
-                    logging.ClearProviders();
-                    logging.AddConsole();
-                    // 可在此處添加更多日誌提供者，例如 Serilog
-                })
                 .ConfigureServices((hostContext, services) =>
                 {
-                    // 註冊設定
-                    services.Configure<ZeroMqSettings>(hostContext.Configuration.GetSection("ZeroMqSettings"));
-
-                    // 註冊核心服務 (單例或 Scoped/Transient 取決於具體需求和實作)
-                    services.AddSingleton<IFundingManager, FundingManager>();
-                    services.AddSingleton<IEvaluationSystem, EvaluationSystem>();
-                    services.AddSingleton<IStrategyManager, StrategyManager>();
-                    services.AddSingleton<IRiskManager, RiskManager>();
-                    services.AddSingleton<IPerformanceManager, PerformanceManager>();
-
-                    // 註冊主要工作服務
-                    services.AddHostedService<TradingWorker>();
+                    // 服務配置現在在 App.xaml.cs 中
                 });
+        */
     }
 }
-
