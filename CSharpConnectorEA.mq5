@@ -8,7 +8,7 @@
 #property version   "1.00"
 #property strict    // 建議使用嚴格模式
 
-#include <zmq.mqh> // 引入 ZeroMQ 函式庫
+#include <Zmq/Zmq.mqh> // 引入 ZeroMQ 函式庫
 
 // --- 添加缺失的 ZeroMQ 錯誤碼定義 ---
 #define ZMQ_EAGAIN   11 // Non-blocking mode was requested and the message cannot be sent at the moment.
